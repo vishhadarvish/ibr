@@ -1,0 +1,162 @@
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using IBApi;
+
+public class IronCondorTrader : EWrapper
+{
+    private EClientSocket clientSocket;
+    private Dictionary<double, int> conIds = new Dictionary<double, int>();
+    private double triggerPrice;
+    private bool contractsReceived = false;
+    private int timeoutInSeconds = 10;  // Timeout in seconds for gathering the 4 ConIds
+
+    public IronCondorTrader()
+    {
+        clientSocket = new EClientSocket(this, new EReaderSignal());
+    }
+
+    public async Task StartAsync()
+    {
+        clientSocket.eConnect("127.0.0.1", 7497, 0); // Connect to IBKR
+
+        // Get user inputs
+        Console.Write("Enter the symbol (e.g., AAPL): ");
+        string symbol = Console.ReadLine();
+
+        Console.Write("Enter expiry date in format YYYYMMDD (e.g., 20250619): ");
+        string expiryDate = Console.ReadLine();
+
+        Console.Write("Enter the trigger underlying price (e.g., 100): ");
+        triggerPrice = Convert.ToDouble(Console.ReadLine());
+
+        await RequestConIdsAsync(symbol, expiryDate);  // Request option contract details for the symbol and expiry
+
+        // Start the timeout timer asynchronously
+        bool timeoutOccurred = await WaitForContractsAsync(timeoutInSeconds);
+
+        // After timeout, ask user if they want to place the order
+        if (!timeoutOccurred && contractsReceived)
+        {
+            Console.WriteLine("All 4 contract details received.");
+            await AskToPlaceOrderAsync();
+        }
+        else
+        {
+            Console.WriteLine("Timeout reached without receiving all contract details.");
+        }
+    }
+
+    private async Task RequestConIdsAsync(string symbol, string expiryDate)
+    {
+        double spread = 5;  // The spread between strike prices
+        double[] strikes = { triggerPrice + spread, triggerPrice + (2 * spread), triggerPrice - spread, triggerPrice - (2 * spread) };
+
+        foreach (double strike in strikes)
+        {
+            string optionType = strike >= triggerPrice ? "C" : "P";  // Call for prices above trigger, Put for below
+            Contract optionContract = GetOptionContract(symbol, expiryDate, strike, optionType);
+            clientSocket.reqContractDetails((int)strike, optionContract);  // Request contract details
+        }
+    }
+
+    private Contract GetOptionContract(string symbol, string expiryDate, double strike, string optionType)
+    {
+        Contract contract = new Contract
+        {
+            Symbol = symbol,
+            SecType = "OPT",  // Option contract
+            Currency = "USD",
+            Exchange = "SMART",
+            LastTradeDateOrContractMonth = expiryDate,
+            Strike = strike,
+            Right = optionType,  // "C" for Call, "P" for Put
+            Multiplier = "100"  // Typically options have a multiplier of 100
+        };
+
+        return contract;
+    }
+
+    // The contractDetails callback will be automatically called by IBKR after contract details are received.
+    public void contractDetails(int reqId, ContractDetails contractDetails)
+    {
+        conIds[reqId] = contractDetails.Contract.ConId;  // Store the ConId
+        Console.WriteLine($"Received ConId: {contractDetails.Contract.ConId} for {contractDetails.Contract.Strike} {contractDetails.Contract.Right}");
+
+        // Check if all 4 ConIds are received
+        if (conIds.Count == 4)
+        {
+            contractsReceived = true;
+        }
+    }
+
+    // Function to handle timeout waiting for all contract details to be received asynchronously
+    private async Task<bool> WaitForContractsAsync(int timeoutInSeconds)
+    {
+        int elapsedTime = 0;
+        while (elapsedTime < timeoutInSeconds && conIds.Count < 4)
+        {
+            await Task.Delay(1000);  // Sleep for 1 second asynchronously
+            elapsedTime++;
+        }
+
+        return elapsedTime >= timeoutInSeconds;
+    }
+
+    private async Task AskToPlaceOrderAsync()
+    {
+        Console.Write("Do you want to execute the Iron Condor order? (yes/no): ");
+        string response = Console.ReadLine().ToLower();
+
+        if (response == "yes")
+        {
+            await PlaceIronCondorOrderAsync();
+        }
+        else
+        {
+            Console.WriteLine("Order not executed.");
+        }
+    }
+
+    private async Task PlaceIronCondorOrderAsync()
+    {
+        // Create the combo order (Iron Condor)
+        ComboLeg leg1 = new ComboLeg { ConId = conIds[triggerPrice + 5], Ratio = 1, Action = "SELL", Exchange = "SMART" };
+        ComboLeg leg2 = new ComboLeg { ConId = conIds[triggerPrice + 10], Ratio = 1, Action = "SELL", Exchange = "SMART" };
+        ComboLeg leg3 = new ComboLeg { ConId = conIds[triggerPrice - 5], Ratio = 1, Action = "BUY", Exchange = "SMART" };
+        ComboLeg leg4 = new ComboLeg { ConId = conIds[triggerPrice - 10], Ratio = 1, Action = "BUY", Exchange = "SMART" };
+
+        // Create the combo contract
+        Contract comboContract = new Contract
+        {
+            Symbol = "IronCondor",
+            SecType = "BAG",  // Bag is used for combination orders
+            Currency = "USD",
+            Exchange = "SMART"
+        };
+
+        // Create the order with market type
+        Order comboOrder = new Order
+        {
+            Action = "SELL",  // Selling the combo order
+            OrderType = "MKT",  // Market order
+            TotalQuantity = 1
+        };
+
+        // Send the combo order
+        List<ComboLeg> comboLegs = new List<ComboLeg> { leg1, leg2, leg3, leg4 };
+        clientSocket.placeOrder(1001, comboContract, comboOrder);
+        Console.WriteLine("Iron Condor order placed!");
+    }
+
+    // Implementing the necessary error methods
+    public void error(Exception e) { Console.WriteLine(e.ToString()); }
+    public void error(string str) { Console.WriteLine(str); }
+    public void error(int id, int errorCode, string errorMsg) { Console.WriteLine($"Error {id}, {errorCode}: {errorMsg}"); }
+
+    public static async Task Main()
+    {
+        IronCondorTrader trader = new IronCondorTrader();
+        await trader.StartAsync();  // Start the process asynchronously
+    }
+}
